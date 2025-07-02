@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/docker/docker/api/types/build"
@@ -18,6 +19,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// XBundle holds bundle metadata
+type XBundle struct {
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+}
+
 type DockerCompose struct {
 	Version  string                 `yaml:"version"`
 	Services map[string]Service     `yaml:"services"`
@@ -25,6 +32,7 @@ type DockerCompose struct {
 	Volumes  map[string]interface{} `yaml:"volumes,omitempty"`
 	Configs  map[string]interface{} `yaml:"configs,omitempty"`
 	Secrets  map[string]interface{} `yaml:"secrets,omitempty"`
+	XBundle  *XBundle               `yaml:"x-bundle"`
 }
 
 type Service struct {
@@ -68,9 +76,8 @@ func main() {
 }
 
 type Bundler struct {
-	client  *client.Client
-	ctx     context.Context
-	cleanup bool // Add this field
+	client *client.Client
+	ctx    context.Context
 }
 
 func NewBundler() *Bundler {
@@ -92,11 +99,28 @@ func (b *Bundler) Bundle(composeFile, outputFile string) error {
 		return fmt.Errorf("failed to parse compose file: %w", err)
 	}
 
+	// Validate x-bundle
+	if compose.XBundle == nil {
+		return fmt.Errorf("missing x-bundle entry in compose file")
+	}
+	if compose.XBundle.Name == "" {
+		return fmt.Errorf("missing name in x-bundle")
+	}
+	if compose.XBundle.Version == "" {
+		return fmt.Errorf("missing version in x-bundle")
+	}
+	if !isValidSemver(compose.XBundle.Version) {
+		return fmt.Errorf("invalid version in x-bundle, must be valid semantic versioning (e.g., 1.2.3)")
+	}
+
+	bundleName := compose.XBundle.Name
+	bundleVersion := compose.XBundle.Version
+
 	// Process services and collect image information
 	imageMap := make(map[string]string) // original -> saved tar filename
 
 	for serviceName, service := range compose.Services {
-		imageName, err := b.processService(serviceName, &service, filepath.Dir(composeFile))
+		imageName, err := b.processServiceWithBundle(serviceName, &service, filepath.Dir(composeFile), bundleName, bundleVersion)
 		if err != nil {
 			return fmt.Errorf("failed to process service %s: %w", serviceName, err)
 		}
@@ -140,7 +164,7 @@ func (b *Bundler) Bundle(composeFile, outputFile string) error {
 	}
 
 	// Create load script
-	if err := b.createLoadScript(tempDir, imageMap); err != nil {
+	if err := b.createLoadScript(tempDir); err != nil {
 		return fmt.Errorf("failed to create load script: %w", err)
 	}
 
@@ -155,7 +179,7 @@ func (b *Bundler) Bundle(composeFile, outputFile string) error {
 	}
 
 	// Cleanup built images
-	if err := b.cleanupImages(imageMap, compose); err != nil {
+	if err := b.cleanupImages(compose); err != nil {
 		// Just log the error, don't fail the bundle creation
 		fmt.Printf("Warning: failed to cleanup some images: %v\n", err)
 	}
@@ -177,40 +201,37 @@ func (b *Bundler) parseComposeFile(filename string) (*DockerCompose, error) {
 	return &compose, nil
 }
 
-func (b *Bundler) processService(serviceName string, service *Service, baseDir string) (string, error) {
-	// If service has build configuration, build the image
-	if service.Build != nil {
-		imageName := fmt.Sprintf("bundled-%s:latest", serviceName)
+// isValidSemver checks if a version string is valid semver (simple regex)
+func isValidSemver(version string) bool {
+	semverRegex := regexp.MustCompile(`^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[\w\.-]+)?(?:\+[\w\.-]+)?$`)
+	return semverRegex.MatchString(version)
+}
 
+// processServiceWithBundle tags built images with bundle name and version
+func (b *Bundler) processServiceWithBundle(serviceName string, service *Service, baseDir, bundleName, bundleVersion string) (string, error) {
+	if service.Build != nil {
+		imageName := fmt.Sprintf("bundles/%s/%s:%s", bundleName, serviceName, bundleVersion)
 		buildConfig, err := parseBuildConfig(service.Build)
 		if err != nil {
 			return "", err
 		}
-
-		// Build the image
 		if err := b.buildImage(buildConfig, baseDir, imageName); err != nil {
 			return "", err
 		}
-
-		// Update service to use the built image
 		service.Image = imageName
 		service.Build = nil
-
 		return imageName, nil
 	}
-
-	// If service has image, pull it if not exists
 	if service.Image != "" {
 		if err := b.pullImageIfNotExists(service.Image); err != nil {
 			return "", err
 		}
 		return service.Image, nil
 	}
-
 	return "", nil
 }
 
-func (b *Bundler) cleanupImages(imageMap map[string]string, compose *DockerCompose) error {
+func (b *Bundler) cleanupImages(compose *DockerCompose) error {
 	// Track which images were built by this bundler
 	builtImages := make(map[string]bool)
 
@@ -394,7 +415,7 @@ func (b *Bundler) writeComposeFile(compose *DockerCompose, outputPath string) er
 	return os.WriteFile(outputPath, data, 0644)
 }
 
-func (b *Bundler) createLoadScript(tempDir string, _ map[string]string) error {
+func (b *Bundler) createLoadScript(tempDir string) error {
 	script := `#!/bin/bash
 set -e
 

@@ -88,6 +88,9 @@ On the target machine:
 ## Example docker-compose.yml
 
 ```yaml
+x-bundle:
+  name: example
+  version: 0.0.1
 services:
   web:
     build: ./web
