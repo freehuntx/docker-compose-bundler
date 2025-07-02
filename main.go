@@ -76,8 +76,9 @@ func main() {
 }
 
 type Bundler struct {
-	client *client.Client
-	ctx    context.Context
+	client              *client.Client
+	ctx                 context.Context
+	freshlyPulledImages map[string]bool // Track images pulled during this run
 }
 
 func NewBundler() *Bundler {
@@ -87,8 +88,9 @@ func NewBundler() *Bundler {
 	}
 
 	return &Bundler{
-		client: cli,
-		ctx:    context.Background(),
+		client:              cli,
+		ctx:                 context.Background(),
+		freshlyPulledImages: make(map[string]bool),
 	}
 }
 
@@ -178,12 +180,13 @@ func (b *Bundler) Bundle(composeFile, outputFile string) error {
 		return fmt.Errorf("failed to create bundle: %w", err)
 	}
 
-	// Cleanup built images
+	// Cleanup built and freshly pulled images
 	if err := b.cleanupImages(compose); err != nil {
-		// Just log the error, don't fail the bundle creation
 		fmt.Printf("Warning: failed to cleanup some images: %v\n", err)
 	}
-
+	if err := b.cleanupFreshlyPulledImages(); err != nil {
+		fmt.Printf("Warning: failed to cleanup some freshly pulled images: %v\n", err)
+	}
 	return nil
 }
 
@@ -254,6 +257,20 @@ func (b *Bundler) cleanupImages(compose *DockerCompose) error {
 		}
 	}
 
+	return nil
+}
+
+func (b *Bundler) cleanupFreshlyPulledImages() error {
+	for imageName := range b.freshlyPulledImages {
+		fmt.Printf("Removing freshly pulled image %s...\n", imageName)
+		_, err := b.client.ImageRemove(b.ctx, imageName, image.RemoveOptions{
+			Force:         false,
+			PruneChildren: true,
+		})
+		if err != nil {
+			fmt.Printf("Warning: failed to remove freshly pulled image %s: %v\n", imageName, err)
+		}
+	}
 	return nil
 }
 
@@ -355,6 +372,9 @@ func (b *Bundler) pullImageIfNotExists(imageName string) error {
 		return err
 	}
 	defer reader.Close()
+
+	// Mark as freshly pulled
+	b.freshlyPulledImages[imageName] = true
 
 	// Read pull output
 	decoder := json.NewDecoder(reader)
