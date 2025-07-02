@@ -1,0 +1,10 @@
+{
+  "name": "web-app",
+  "version": "1.0.0",
+  "description": "Example web application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
